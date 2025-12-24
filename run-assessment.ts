@@ -1,6 +1,6 @@
 /**
  * DemoMed Healthcare API Assessment
- * Node.js 18+ required
+ * Node.js 18+
  * Run with: npm run start
  */
 
@@ -15,9 +15,6 @@ type PatientsResponse = {
   data?: Patient[];
   pagination?: {
     page?: number;
-    limit?: number;
-    total?: number;
-    totalPages?: number;
     hasNext?: boolean;
   };
 };
@@ -51,8 +48,8 @@ async function fetchWithRetry(
       }
 
       return res;
-    } catch (err) {
-      if (attempt >= retries) throw err;
+    } catch {
+      if (attempt >= retries) throw new Error("Network error");
       const delay = 300 * Math.pow(2, attempt) + Math.random() * 200;
       await sleep(delay);
       attempt++;
@@ -60,29 +57,53 @@ async function fetchWithRetry(
   }
 }
 
-// -------------------- Parsing & Scoring --------------------
+// -------------------- Strict Parsing --------------------
 
 function toNumberStrict(value: unknown): number | null {
   if (value === null || value === undefined) return null;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const n = Number(value.trim());
-    return Number.isFinite(n) ? n : null;
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
   }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return null;
+    if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
+    return Number(trimmed);
+  }
+
   return null;
 }
 
 function parseBloodPressure(bp: unknown): { sys: number; dia: number } | null {
   if (typeof bp !== "string") return null;
-  const parts = bp.split("/");
+
+  const raw = bp.trim();
+  if (raw.length === 0) return null;
+
+  const parts = raw.split("/");
   if (parts.length !== 2) return null;
 
-  const sys = Number(parts[0]);
-  const dia = Number(parts[1]);
+  const sysStr = parts[0].trim();
+  const diaStr = parts[1].trim();
+
+  // Reject "150/" or "/90"
+  if (sysStr.length === 0 || diaStr.length === 0) return null;
+
+  if (!/^\d+(\.\d+)?$/.test(sysStr) || !/^\d+(\.\d+)?$/.test(diaStr)) {
+    return null;
+  }
+
+  const sys = Number(sysStr);
+  const dia = Number(diaStr);
 
   if (!Number.isFinite(sys) || !Number.isFinite(dia)) return null;
+
   return { sys, dia };
 }
+
+// -------------------- Scoring --------------------
 
 function scoreBloodPressure(bp: unknown): { score: number; valid: boolean } {
   const parsed = parseBloodPressure(bp);
@@ -125,34 +146,27 @@ function scoreAge(age: unknown): { score: number; valid: boolean } {
 // -------------------- API Logic --------------------
 
 async function getAllPatients(): Promise<Patient[]> {
-  const allPatients: Patient[] = [];
+  const patients: Patient[] = [];
   let page = 1;
   let hasNext = true;
 
   while (hasNext) {
     const url = `${BASE_URL}/patients?page=${page}&limit=${PAGE_LIMIT}`;
-
     const res = await fetchWithRetry(url, {
       headers: { "x-api-key": API_KEY },
     });
 
-    if (!res.ok) {
-      throw new Error(`Failed to fetch patients: ${res.status}`);
-    }
+    if (!res.ok) throw new Error("Failed to fetch patients");
 
     const json: PatientsResponse = await res.json();
-
-    if (Array.isArray(json.data)) {
-      allPatients.push(...json.data);
-    }
+    if (Array.isArray(json.data)) patients.push(...json.data);
 
     hasNext = Boolean(json.pagination?.hasNext);
     page++;
-
     await sleep(120);
   }
 
-  return allPatients;
+  return patients;
 }
 
 async function submitResults(payload: {
@@ -169,10 +183,7 @@ async function submitResults(payload: {
     body: JSON.stringify(payload),
   });
 
-  const json = await res.json();
-  if (!res.ok) throw new Error("Submission failed");
-
-  return json;
+  return res.json();
 }
 
 function uniqueSorted(arr: string[]) {
@@ -186,7 +197,7 @@ async function main() {
 
   const highRisk: string[] = [];
   const feverPatients: string[] = [];
-  const dataQualityIssues: string[] = [];
+  const dataQuality: string[] = [];
 
   for (const p of patients) {
     if (!p.patient_id) continue;
@@ -196,7 +207,7 @@ async function main() {
     const age = scoreAge(p.age);
 
     if (!bp.valid || !temp.valid || !age.valid) {
-      dataQualityIssues.push(p.patient_id);
+      dataQuality.push(p.patient_id);
     }
 
     const totalRisk = bp.score + temp.score + age.score;
@@ -208,7 +219,7 @@ async function main() {
   const payload = {
     high_risk_patients: uniqueSorted(highRisk),
     fever_patients: uniqueSorted(feverPatients),
-    data_quality_issues: uniqueSorted(dataQualityIssues),
+    data_quality_issues: uniqueSorted(dataQuality),
   };
 
   console.log("Submitting results:", payload);
@@ -218,6 +229,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Error:", err);
+  console.error("Fatal error:", err);
   process.exit(1);
 });
